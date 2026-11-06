@@ -74,7 +74,7 @@
 
 ## 安装与卸载
 
-- 安装（本 fork）：插件页填 git 地址 `git+https://github.com/puny-code/dsh-auth-cookie-guard.git`，或本地源码目录（工具会以 `link:` 方式引入）。工具会把它写进 profile 的 `package.json`（`dsh.profile.bundles` 与依赖）；本 bundle 自带的 `cordis.patch.yml` 作为独立层插入那一行，profile 自己的 `cordis.patch.yml` 不需要任何改动。不要手改 profile 文件。
+- 安装（本 fork，三选一）：插件页填发行包 `https://github.com/puny-code/dsh-auth-cookie-guard/releases/download/v1.0.7/dsh-auth-cookie-guard-1.0.7.tgz`；或 git 地址 `git+https://github.com/puny-code/dsh-auth-cookie-guard.git`；或本地源码目录（工具会以 `link:` 方式引入）。工具会把它写进 profile 的 `package.json`（`dsh.profile.bundles` 与依赖）；本 bundle 自带的 `cordis.patch.yml` 作为独立层插入那一行，profile 自己的 `cordis.patch.yml` 不需要任何改动。不要手改 profile 文件。
 - 已锁死的 profile 也能救回来：装上之后**下一次启动**的握手就会被放行（预算先抬），并在同一个响应里把旧 cookie 批量删掉；不需要换 profile、不需要撤销授权。若 jar 大到超过 64 KiB，按上面「配置」一节临时抬到 `262144` 跑一次即可。
 - 生效方式：安装时宿主会重载组合，插件当场 apply，无需重启桌面端；之后每次启动同样自动生效。
 - 卸载：在插件管理中移除该 bundle，重启桌面端；卸载后会恢复监听器的原始头部预算（插件在 dispose 时还原）。
