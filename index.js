@@ -42,6 +42,12 @@
  * can never run, because a connection rejected with 431 never reaches the
  * listener.
  *
+ * The guard also binds late rather than not at all: `webServer` is registered
+ * before `[Service.init]` binds its socket, so a composition that loads this row
+ * early would otherwise find `webServer.server` unset and guard nothing while
+ * still looking installed. It now waits for the listener (bounded) and reports
+ * loudly if it never appears.
+ *
  * ## What it deliberately does not do
  *
  * It never decodes a cookie value, renames, re-signs, or rewrites a cookie it
@@ -94,34 +100,52 @@ const EXPIRATION = 'Max-Age=0; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT'
 const MAX_RETIRE_PER_RESPONSE = 96
 
 /**
+ * How often a not-yet-bound listener is re-checked.
+ *
+ * `webServer` is registered before `[Service.init]` binds the socket, so the
+ * guard may apply while `webServer.server` is still unset. The re-check is a
+ * cheap property read once per interval, and it stops as soon as the listener
+ * appears.
+ */
+const RECHECK_MS = 100
+
+/**
+ * How many re-checks (10 s at this interval) before reporting the listener as
+ * missing. Bounded on purpose: a guard that silently never applies is worse than
+ * a loud failure, because the desktop welcome stays locked out either way and
+ * only the log can say why.
+ */
+const RECHECK_LIMIT = 100
+
+/**
  * Guard the local listener.
+ *
+ * The `webServer` service is registered as soon as it is constructed but binds
+ * its socket in `[Service.init]`, so depending on a composition's load order
+ * this plugin can apply while `webServer.server` is still `undefined`. Bailing
+ * out there is the difference between a guard that works and one that looks
+ * installed but silently guards nothing, so the listener is picked up as soon
+ * as it appears instead: the guard binds immediately when it can, and otherwise
+ * re-checks on a short timer (bounded, so a listener that never binds is
+ * reported instead of waited on forever).
  *
  * @param ctx - plugin context; `webServer` is the live service.
  * @param config - optional `{ maxHeaderBytes, keep }` overrides.
  */
 export function apply(ctx, config = {}) {
-  const webServer = ctx.webServer
-  const server = webServer?.server
-
-  if (server === void 0) {
-    ctx.logger?.warn('auth-cookie-guard: webServer has no listener yet, nothing to guard')
-    return
-  }
-
   const maxHeaderBytes = bounded(config.maxHeaderBytes, DEFAULTS.maxHeaderBytes, LIMITS.maxHeaderBytes)
   const keep = bounded(config.keep, DEFAULTS.keep, LIMITS.keep)
 
-  // Node reads this per connection, so the value applies to connections that
-  // have not been accepted yet — the handshake we are trying to rescue.
-  const previous = server.maxHeaderSize
-  server.maxHeaderSize = maxHeaderBytes
-
-  // The cookie this process just minted is the newest one, but keeping it by
-  // name also covers a clock that moved backwards between two starts. The name
-  // is resolved per request exactly as the Host resolves it, so a page opened on
-  // `localhost` instead of `127.0.0.1` still protects the cookie it is using.
-  const protocol = originProtocol(webServer)
-  const bound = cookieNameOf(protocol, boundHost(webServer))
+  /** The listener currently guarded; `undefined` before the service binds. */
+  let guarded
+  /** The listener's own budget before this plugin raised it. */
+  let previous
+  /** The budget this plugin assigned, restored only while it is still in force. */
+  let applied
+  /** Pending re-check for a listener that has not bound yet. */
+  let timer
+  /** Number of re-checks spent waiting for the listener. */
+  let waited = 0
 
   /**
    * Delete the launch cookies this instance will never authenticate on the
@@ -144,11 +168,18 @@ export function apply(ctx, config = {}) {
     }
     if (names.length === 0) return
 
+    // Resolved per request, exactly as the Host resolves it: the protocol the
+    // listener actually serves, and the authority this request arrived on, so a
+    // page opened on `localhost` instead of `127.0.0.1` still protects the
+    // cookie it is using. The listener's own origin is the fallback for requests
+    // that carry no Host header.
+    const protocol = originProtocol(ctx.webServer)
+    const current = cookieNameOf(protocol, req.headers.host) ?? cookieNameOf(protocol, boundHost(ctx.webServer))
+
     // Browsers emit the jar oldest first (RFC 6265 section 5.4), so the tail
     // holds the newest launches; the current authority is kept by name even
     // when it is not in that tail.
     const retained = new Set(names.slice(-keep))
-    const current = cookieNameOf(protocol, req.headers.host) ?? bound
     if (current !== undefined) retained.add(current)
 
     const stale = [...new Set(names)].filter((name) => !retained.has(name))
@@ -163,17 +194,80 @@ export function apply(ctx, config = {}) {
     )
   }
 
-  ctx.effect(() => {
+  /**
+   * Stop guarding the listener picked up earlier, restoring its own budget.
+   *
+   * @returns nothing.
+   */
+  function release() {
+    if (guarded === undefined) return
+    guarded.removeListener('request', retire)
+    if (guarded.maxHeaderSize === applied) guarded.maxHeaderSize = previous
+    guarded = undefined
+    previous = undefined
+    applied = undefined
+  }
+
+  /**
+   * Take the service's listener under guard, if it has one by now.
+   *
+   * Node reads `maxHeaderSize` per connection, so the assigned value applies to
+   * connections that have not been accepted yet — the handshake this plugin is
+   * trying to rescue. A listener that already carries a larger budget keeps it:
+   * this plugin only ever raises the ceiling.
+   *
+   * @returns whether the listener is under guard after this call.
+   */
+  function bind() {
+    const server = ctx.webServer?.server
+    if (server === undefined || server === null) return false
+    if (server === guarded) return true
+
+    release()
+    const own = Number(server.maxHeaderSize)
+    previous = server.maxHeaderSize
+    applied = Number.isFinite(own) && own > maxHeaderBytes ? own : maxHeaderBytes
+    server.maxHeaderSize = applied
     server.prependListener('request', retire)
+    guarded = server
+
+    ctx.logger?.info?.(
+      `auth-cookie-guard: listener header budget ${String(applied)} bytes, keeping ${String(keep)} launch cookie(s)`,
+    )
+    return true
+  }
+
+  ctx.effect(() => {
+    if (bind()) return release
+
+    ctx.logger?.info?.(
+      `auth-cookie-guard: waiting for webServer to bind, then raising its header budget to ${String(maxHeaderBytes)} bytes`,
+    )
+    timer = setInterval(() => {
+      waited += 1
+      if (bind()) {
+        clearInterval(timer)
+        timer = undefined
+        return
+      }
+      if (waited < RECHECK_LIMIT) return
+      clearInterval(timer)
+      timer = undefined
+      ctx.logger?.error?.(
+        'auth-cookie-guard: webServer never exposed a listener, so the header budget is NOT raised and stale launch cookies are NOT retired',
+      )
+    }, RECHECK_MS)
+    // Waiting for the listener must never hold the process open on its own.
+    timer.unref?.()
+
     return () => {
-      server.removeListener('request', retire)
-      if (server.maxHeaderSize === maxHeaderBytes) server.maxHeaderSize = previous
+      if (timer !== undefined) {
+        clearInterval(timer)
+        timer = undefined
+      }
+      release()
     }
   })
-
-  ctx.logger?.info?.(
-    `auth-cookie-guard: listener header budget ${String(maxHeaderBytes)} bytes, keeping ${String(keep)} launch cookie(s)`,
-  )
 }
 
 /**

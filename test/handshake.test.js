@@ -322,3 +322,132 @@ test('cookie names and values never reach the logger', async () => {
     await server.close()
   }
 })
+
+/** Resolve after `ms`, for the deferred-binding cases. */
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+/**
+ * Apply the plugin to a context whose `webServer` has not bound a listener yet,
+ * the way a composition can load this row before `[Service.init]` runs.
+ *
+ * @returns the mutable context plus the dispose the effect registered.
+ */
+function unboundContext(logger = { info() {}, warn() {}, error() {} }) {
+  const webServer = {}
+  const ctx = {
+    webServer,
+    logger,
+    effect: (fn) => {
+      ctx.dispose = fn()
+      return () => {}
+    },
+  }
+  apply(ctx)
+  return ctx
+}
+
+test('a listener that binds after apply is raised and prunes on its first request', async () => {
+  const messages = []
+  const ctx = unboundContext({ info: (message) => messages.push(message), warn() {}, error() {} })
+  const server = createServer((req, res) => {
+    res.writeHead(303, { location: './', 'set-cookie': 'dsh-auth-new=1; Path=/' })
+    res.end()
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    ctx.webServer.server = server
+    ctx.webServer.getOrigin = () => `http://127.0.0.1:${server.address().port}`
+    await sleep(250)
+
+    assert.equal(server.maxHeaderSize, 65536)
+    assert.ok(messages.some((message) => message.includes('waiting for webServer to bind')))
+
+    const response = await fetch(`${ctx.webServer.getOrigin()}/?token=launch-token`, {
+      headers: { cookie: jar(10) },
+      redirect: 'manual',
+    })
+    const deletions = response.headers.getSetCookie().filter((line) => line.includes('Max-Age=0'))
+    assert.equal(deletions.length, 6)
+  } finally {
+    ctx.dispose?.()
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('disposing restores the listener budget it raised', async () => {
+  const ctx = unboundContext()
+  const server = createServer((req, res) => {
+    res.end('ok')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    ctx.webServer.server = server
+    await sleep(250)
+    assert.equal(server.maxHeaderSize, 65536)
+  } finally {
+    ctx.dispose?.()
+    assert.equal(server.maxHeaderSize, undefined)
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('a listener that already carries a larger budget keeps it, and keeps it after dispose', async () => {
+  const server = createServer((req, res) => {
+    res.end('ok')
+  })
+  server.maxHeaderSize = 200_000
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const origin = `http://127.0.0.1:${server.address().port}`
+  const ctx = {
+    webServer: { server, getOrigin: () => origin },
+    logger: { info() {}, warn() {}, error() {} },
+    effect: (fn) => {
+      ctx.dispose = fn()
+      return () => {}
+    },
+  }
+  try {
+    apply(ctx)
+    assert.equal(server.maxHeaderSize, 200_000)
+  } finally {
+    ctx.dispose?.()
+    assert.equal(server.maxHeaderSize, 200_000)
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('a replaced listener is guarded again on the next apply', async () => {
+  // A composition reload disposes this fiber and applies it again, so the guard
+  // has to be re-entrant: the previous listener must be released and the new one
+  // taken under guard.
+  const first = createServer((req, res) => {
+    res.end('ok')
+  })
+  await new Promise((resolve) => first.listen(0, '127.0.0.1', resolve))
+  const second = createServer((req, res) => {
+    res.end('ok')
+  })
+  await new Promise((resolve) => second.listen(0, '127.0.0.1', resolve))
+  try {
+    const firstCtx = unboundContext()
+    firstCtx.webServer.server = first
+    await sleep(250)
+    assert.equal(first.maxHeaderSize, 65536)
+    firstCtx.dispose?.()
+    assert.equal(first.maxHeaderSize, undefined)
+
+    const secondCtx = unboundContext()
+    secondCtx.webServer.server = second
+    await sleep(250)
+    assert.equal(second.maxHeaderSize, 65536)
+    secondCtx.dispose?.()
+    assert.equal(second.maxHeaderSize, undefined)
+  } finally {
+    await new Promise((resolve) => first.close(resolve))
+    await new Promise((resolve) => second.close(resolve))
+  }
+})
